@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+# brew-safe — install Homebrew packages only if their formula/cask has been
+# stable (untouched upstream) for at least N days.
+#
+# Rationale: most malicious formula changes are caught and reverted
+# within a few days. By refusing to install formulae that have been
+# modified very recently, we let the community vetting window do its
+# work — without rolling our whole tap back in time.
+#
+# How the age is determined:
+#   `brew info --json=v2` gives each package's upstream tap and its source
+#   path (e.g. homebrew/core + Formula/s/sesh.rb). The last commit touching
+#   that path is then read from the GitHub API. This deliberately does NOT
+#   require a local clone of homebrew-core: Homebrew installs from its JSON
+#   API by default and no longer checks out homebrew-core at all, so the
+#   older `brew --repo homebrew/core` + `git log` approach failed outright
+#   on every formula.
+#
+# Usage:
+#   brew-safe [-d DAYS] [-j JOBS] [--force | --only-stable] install <formula>...
+#   brew-safe [-d DAYS] [-j JOBS] [--force | --only-stable] upgrade [formula...]
+#   brew-safe [-d DAYS] [-j JOBS] [--force | --only-stable] reinstall <formula>...
+#   brew-safe [-d DAYS] [-j JOBS] [--force | --only-stable] install --cask <cask>...
+#
+# Examples:
+#   brew-safe install ripgrep
+#   brew-safe -d 7 upgrade
+#   brew-safe install --cask firefox
+#   brew-safe --force install some-package    # bypass the age check
+#   brew-safe --only-stable upgrade           # upgrade just the packages that pass
+#   brew-safe -j 4 upgrade                   # check up to 4 packages at once
+#
+# Checks use 8 workers by default. -j/--jobs accepts 1–64; use -j 1 for
+# sequential checks. Only the checks run concurrently, never brew mutations.
+#
+# About --force: it is consumed as *our* "skip the age check" flag only for
+# the subcommands we actually age-check (install/upgrade/reinstall). For any
+# other subcommand this script is a transparent pass-through, so --force is
+# forwarded to brew untouched — `brew-safe tap homebrew/core --force` reaches
+# brew as `tap homebrew/core --force`. Previously --force was swallowed
+# unconditionally, which made it impossible to pass to any brew subcommand.
+# `--` still forwards everything after it verbatim.
+#
+# About --only-stable: instead of aborting the whole run when some packages are
+# too fresh or unverifiable, run brew on *only* the packages that passed the
+# age check and skip the rest. Purely our flag (brew has no such option), so it
+# is always consumed here, never forwarded. If nothing passes, there is nothing
+# safe to do and we exit 0. --force and --only-stable express opposite intents
+# ("install everything" vs "skip the fresh ones") and are mutually exclusive;
+# passing both is a usage error.
+#
+# Exit codes:
+#   0   success
+#   1   one or more packages are too fresh, or could not be verified
+#   2   usage error
+
+set -euo pipefail
+
+DAYS=5
+JOBS=8
+FORCE=0
+ONLY_STABLE=0
+
+# Subcommands whose packages we age-check. Everything else is forwarded.
+is_age_checked() {
+  case "${1:-}" in
+    install | upgrade | reinstall) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# --- pass 1: identify the subcommand ------------------------------------
+# We must know the subcommand before deciding who owns `--force`, so the
+# arguments get scanned twice. This pass only looks for the first bare word,
+# skipping flags and the values that -d/--days and -j/--jobs consume.
+find_subcommand() {
+  local arg skip_next=0
+  for arg in "$@"; do
+    if ((skip_next)); then
+      skip_next=0
+      continue
+    fi
+    case "$arg" in
+      -d | --days | -j | --jobs) skip_next=1 ;;
+      --) ;; # separator, not a subcommand
+      -*) ;; # any other flag
+      *)
+        printf '%s' "$arg"
+        return 0
+        ;;
+    esac
+  done
+}
+
+SUBCOMMAND="$(find_subcommand "$@")"
+OWNS_FORCE=0
+is_age_checked "$SUBCOMMAND" && OWNS_FORCE=1
+
+# --- pass 2: split our flags from brew's --------------------------------
+BREW_ARGS=()
+passthrough=0
+while [[ $# -gt 0 ]]; do
+  if ((passthrough)); then
+    BREW_ARGS+=("$1")
+    shift
+    continue
+  fi
+  case "$1" in
+    -d | --days)
+      [[ -z "${2:-}" ]] && {
+        echo "error: $1 requires a value" >&2
+        exit 2
+      }
+      DAYS="$2"
+      shift 2
+      ;;
+    -j | --jobs)
+      [[ -z "${2:-}" ]] && {
+        echo "error: $1 requires a value" >&2
+        exit 2
+      }
+      JOBS="$2"
+      shift 2
+      ;;
+    --force)
+      if ((OWNS_FORCE)); then
+        FORCE=1 # ours: skip the age check
+      else
+        BREW_ARGS+=("$1") # brew's: forward it
+      fi
+      shift
+      ;;
+    --only-stable)
+      # Purely ours — brew has no such flag, so always consume it, never
+      # forward. Only meaningful for age-checked subcommands; harmlessly
+      # ignored otherwise (those are straight pass-throughs below).
+      ONLY_STABLE=1
+      shift
+      ;;
+    --)
+      shift
+      passthrough=1
+      ;;
+    *)
+      BREW_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#BREW_ARGS[@]} -eq 0 ]]; then
+  echo "usage: brew-safe [-d DAYS] [-j JOBS] [--force | --only-stable] <brew args...>" >&2
+  exit 2
+fi
+
+if [[ ! "$DAYS" =~ ^[0-9]+$ ]]; then
+  echo "error: days must be a non-negative integer, got '$DAYS'" >&2
+  exit 2
+fi
+
+if [[ ! "$JOBS" =~ ^[1-9][0-9]?$ ]] || ((JOBS > 64)); then
+  echo "error: jobs must be an integer between 1 and 64, got '$JOBS'" >&2
+  exit 2
+fi
+
+if ((FORCE && ONLY_STABLE)); then
+  echo "error: --force and --only-stable are mutually exclusive" >&2
+  exit 2
+fi
+
+# Our zsh wrapper is a shell function, so a bare `brew` inside this bash
+# script already resolves to the real binary via PATH. Resolve it once and be
+# explicit about it so the intent survives future edits.
+BREW_BIN="$(command -v brew || true)"
+if [[ -z "$BREW_BIN" ]]; then
+  echo "error: brew not found in PATH" >&2
+  exit 1
+fi
+
+for tool in jq curl; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "error: $tool is required by brew-safe but was not found in PATH" >&2
+    exit 1
+  fi
+done
+
+# Anything we don't age-check is a straight pass-through.
+if ! is_age_checked "$SUBCOMMAND"; then
+  exec "$BREW_BIN" "${BREW_ARGS[@]}"
+fi
+
+# --- figure out which packages we'd be installing -----------------------
+# BASE_ARGS captures the subcommand and every flag *except* package names, so
+# that --only-stable can later rebuild the command as `brew <BASE_ARGS>
+# <stable packages>`. PACKAGES captures just the names we age-check.
+# Leave the type unset unless the caller chooses one: brew can resolve a
+# bare name to either a formula or a cask, including on a first install.
+PACKAGE_KIND=""
+PACKAGES=()
+BASE_ARGS=()
+seen_subcommand=0
+
+for arg in "${BREW_ARGS[@]}"; do
+  if ((!seen_subcommand)) && [[ "$arg" != -* ]]; then
+    seen_subcommand=1
+    BASE_ARGS+=("$arg") # the subcommand
+    continue
+  fi
+  case "$arg" in
+    --cask | --casks)
+      PACKAGE_KIND="--cask"
+      BASE_ARGS+=("$arg")
+      ;;
+    --formula | --formulae)
+      PACKAGE_KIND="--formula"
+      BASE_ARGS+=("$arg")
+      ;;
+    -*) BASE_ARGS+=("$arg") ;; # other flags — keep for the rebuilt command
+    *) PACKAGES+=("$arg") ;;
+  esac
+done
+
+# `brew upgrade` with no args means "upgrade everything" — expand it so
+# we can age-check each outdated package individually.
+if [[ "$SUBCOMMAND" == "upgrade" && ${#PACKAGES[@]} -eq 0 ]]; then
+  if [[ "$PACKAGE_KIND" == "--cask" ]]; then
+    mapfile -t PACKAGES < <("$BREW_BIN" outdated --cask --quiet)
+  else
+    mapfile -t PACKAGES < <("$BREW_BIN" outdated --formula --quiet)
+  fi
+  if [[ ${#PACKAGES[@]} -eq 0 ]]; then
+    echo "nothing to upgrade."
+    exit 0
+  fi
+  echo "→ would upgrade: ${PACKAGES[*]}"
+fi
+
+if [[ ${#PACKAGES[@]} -eq 0 ]]; then
+  # No packages to check (e.g. `brew install` with only flags) — just forward.
+  exec "$BREW_BIN" "${BREW_ARGS[@]}"
+fi
+
+# --- resolve a package to its upstream tap and source path --------------
+# Emits "<tap>\t<ruby_source_path>". On failure, save the actual lookup
+# error for the worker to report rather than calling every failure unknown.
+pkg_source() {
+  local pkg="$1" error_file="$2" json src
+  local info_args=(info --json=v2)
+  if [[ -n "$PACKAGE_KIND" ]]; then
+    info_args+=("$PACKAGE_KIND")
+  fi
+  if ! json="$("$BREW_BIN" "${info_args[@]}" "$pkg" 2>"$error_file")"; then
+    if [[ ! -s "$error_file" ]]; then
+      printf 'brew info failed for %s\n' "$pkg" > "$error_file"
+    fi
+    return 1
+  fi
+
+  if ! src="$(printf '%s' "$json" | jq -er '
+      (if ((.formulae // []) | length) > 0 then .formulae[0]
+       elif ((.casks // []) | length) > 0 then .casks[0]
+       else empty end)
+      | select((.tap | type) == "string" and (.tap | length) > 0
+               and (.ruby_source_path | type) == "string"
+               and (.ruby_source_path | length) > 0)
+      | "\(.tap)\t\(.ruby_source_path)"
+    ' 2>"$error_file")"; then
+    printf 'brew info returned missing or invalid source metadata for %s\n' "$pkg" > "$error_file"
+    return 1
+  fi
+  printf '%s' "$src"
+}
+
+# Only these two taps can be age-checked; anything else is unverifiable and
+# therefore treated as unsafe (see the fail-closed note below).
+tap_to_repo() {
+  case "$1" in
+    homebrew/core) printf 'Homebrew/homebrew-core' ;;
+    homebrew/cask) printf 'Homebrew/homebrew-cask' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Emits "<epoch>\t<iso8601>\t<commit url>" for the last commit touching a path.
+# Prefers gh (authenticated, 5000 req/hr) and falls back to unauthenticated
+# curl (60 req/hr), so a missing or logged-out gh still works.
+last_commit_info() {
+  local repo="$1" path="$2" json="" iso="" url="" epoch=""
+  local api="repos/$repo/commits?path=$path&per_page=1"
+
+  if command -v gh >/dev/null 2>&1; then
+    json="$(gh api "$api" 2>/dev/null || true)"
+  fi
+  if [[ -z "$json" ]]; then
+    json="$(curl -fsSL "https://api.github.com/$api" 2>/dev/null || true)"
+  fi
+  [[ -z "$json" ]] && return 1
+
+  iso="$(printf '%s' "$json" | jq -r '.[0].commit.committer.date // empty' 2>/dev/null || true)"
+  url="$(printf '%s' "$json" | jq -r '.[0].html_url // empty' 2>/dev/null || true)"
+  [[ -z "$iso" ]] && return 1
+
+  epoch="$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$iso" +%s 2>/dev/null || true)"
+  [[ -z "$epoch" ]] && return 1
+
+  printf '%s\t%s\t%s' "$epoch" "$iso" "$url"
+}
+
+# --- age-check each package ---------------------------------------------
+NOW_EPOCH="$(date +%s)"
+THRESHOLD_SECS=$((DAYS * 86400))
+STABLE_PACKAGES=()
+FRESH_PACKAGES=()
+FRESH_URLS=()
+UNVERIFIED_PACKAGES=()
+UNVERIFIED_REASONS=()
+
+# Workers write separate result files; only the parent updates the package
+# arrays and prints reports, preserving argument order without interleaving.
+check_package() {
+  local pkg="$1" result="$2"
+  local src tap rel_path repo info last_epoch rest last_iso commit_url age_secs age_days line
+
+  if ! src="$(pkg_source "$pkg" "$result.error")"; then
+    printf "  %-30s  ⚠️  could not verify — package metadata lookup failed\n" "$pkg"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      printf '    %s\n' "$line"
+    done < "$result.error"
+    printf 'unverified\t%s\n' "package metadata lookup failed (see error above)" > "$result"
+    return
+  fi
+
+  tap="${src%%$'\t'*}"
+  rel_path="${src#*$'\t'}"
+
+  if ! repo="$(tap_to_repo "$tap")"; then
+    printf "  %-30s  ⚠️  could not verify — third-party tap %s\n" "$pkg" "$tap"
+    printf 'unverified\t%s\n' "lives in third-party tap '${tap}', which is not age-checked" > "$result"
+    return
+  fi
+
+  if ! info="$(last_commit_info "$repo" "$rel_path")"; then
+    printf "  %-30s  ⚠️  could not verify — GitHub API lookup failed\n" "$pkg"
+    printf 'unverified\t%s\n' "GitHub API lookup failed for ${repo}/${rel_path} (offline, rate-limited, or path moved)" > "$result"
+    return
+  fi
+
+  last_epoch="${info%%$'\t'*}"
+  rest="${info#*$'\t'}"
+  last_iso="${rest%%$'\t'*}"
+  commit_url="${rest#*$'\t'}"
+
+  age_secs=$((NOW_EPOCH - last_epoch))
+  age_days=$((age_secs / 86400))
+
+  if ((age_secs < THRESHOLD_SECS)); then
+    printf "  %-30s  ❌ modified %2d days ago  (%s)\n" "$pkg" "$age_days" "$last_iso"
+    printf 'fresh\t%s\n' "${commit_url:-$repo/commits/HEAD}" > "$result"
+  else
+    printf "  %-30s  ✅ stable %3d days       (%s)\n" "$pkg" "$age_days" "$last_iso"
+    printf 'stable\n' > "$result"
+  fi
+}
+
+CHECK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/brew-safe.XXXXXX")"
+cleanup_checks() {
+  local pid
+  # jobs lists only our running children, avoiding stale/reused PIDs.
+  for pid in $(jobs -pr); do
+    kill "$pid" 2>/dev/null || true
+  done
+  wait 2>/dev/null || true
+  rm -rf -- "$CHECK_DIR"
+}
+trap cleanup_checks EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "→ checking that each package has been stable for ≥ ${DAYS} days (up to ${JOBS} at once)…"
+echo
+
+CHECK_PIDS=()
+for ((worker = 0; worker < JOBS && worker < ${#PACKAGES[@]}; worker++)); do
+  (
+    trap - EXIT HUP INT TERM
+    for ((index = worker; index < ${#PACKAGES[@]}; index += JOBS)); do
+      check_package "${PACKAGES[$index]}" "$CHECK_DIR/$index.result" > "$CHECK_DIR/$index.output"
+    done
+  ) &
+  CHECK_PIDS+=("$!")
+done
+
+for pid in "${CHECK_PIDS[@]}"; do
+  # A crashed worker leaves missing results, which are rejected below.
+  wait "$pid" || true
+done
+
+for i in "${!PACKAGES[@]}"; do
+  pkg="${PACKAGES[$i]}"
+  status="" detail=""
+  if [[ -f "$CHECK_DIR/$i.result" ]]; then
+    IFS=$'\t' read -r status detail < "$CHECK_DIR/$i.result" || status=""
+  fi
+  case "$status" in
+    stable) STABLE_PACKAGES+=("$pkg") ;;
+    fresh)
+      FRESH_PACKAGES+=("$pkg")
+      FRESH_URLS+=("$detail")
+      ;;
+    unverified)
+      UNVERIFIED_PACKAGES+=("$pkg")
+      UNVERIFIED_REASONS+=("$detail")
+      ;;
+    *)
+      UNVERIFIED_PACKAGES+=("$pkg")
+      UNVERIFIED_REASONS+=("package check failed unexpectedly")
+      printf "  %-30s  ⚠️  could not verify — package check failed unexpectedly\n" "$pkg"
+      continue
+      ;;
+  esac
+  cat "$CHECK_DIR/$i.output"
+done
+
+# exec does not run EXIT traps, so remove temporary files before running brew.
+cleanup_checks
+trap - EXIT HUP INT TERM
+
+echo
+
+# --- decide what to do --------------------------------------------------
+# Fail closed, and be explicit about *which* of the two reasons applies:
+# "we checked and it is too new" is a very different situation from "we could
+# not check at all", and the old script reported both as the same failure.
+BLOCKED=0
+
+if [[ ${#UNVERIFIED_PACKAGES[@]} -gt 0 ]]; then
+  BLOCKED=1
+  echo "🛑 could not verify the age of:"
+  for i in "${!UNVERIFIED_PACKAGES[@]}"; do
+    printf '   - %s — %s\n' "${UNVERIFIED_PACKAGES[$i]}" "${UNVERIFIED_REASONS[$i]}"
+  done
+  echo
+  echo "   This is not a claim that they are unsafe, only that the check could"
+  echo "   not run. Treated as unsafe on purpose: an attacker could otherwise"
+  echo "   hide behind a name we are unable to verify."
+  echo
+fi
+
+if [[ ${#FRESH_PACKAGES[@]} -gt 0 ]]; then
+  BLOCKED=1
+  echo "🛑 updated upstream within the last ${DAYS} days:"
+  for i in "${!FRESH_PACKAGES[@]}"; do
+    printf '   - %s\n' "${FRESH_PACKAGES[$i]}"
+    printf '     review: %s\n' "${FRESH_URLS[$i]}"
+  done
+  echo
+fi
+
+if ((BLOCKED)); then
+  if ((FORCE)); then
+    echo "→ --force given; proceeding anyway."
+    echo
+  elif ((ONLY_STABLE)); then
+    skipped=$((${#FRESH_PACKAGES[@]} + ${#UNVERIFIED_PACKAGES[@]}))
+    if [[ ${#STABLE_PACKAGES[@]} -eq 0 ]]; then
+      echo "→ --only-stable: no packages passed the age check; nothing to do."
+      exit 0
+    fi
+    echo "→ --only-stable: proceeding with the ${#STABLE_PACKAGES[@]} package(s) that passed; skipping ${skipped}."
+    echo
+    echo "→ running: brew ${BASE_ARGS[*]} ${STABLE_PACKAGES[*]}"
+    echo
+    exec "$BREW_BIN" "${BASE_ARGS[@]}" "${STABLE_PACKAGES[@]}"
+  else
+    echo "Refusing to install. Options:"
+    if [[ ${#FRESH_PACKAGES[@]} -gt 0 ]]; then
+      echo "  • wait until the package has aged past ${DAYS} days"
+      echo "  • open the review link above and read the change yourself"
+    fi
+    if [[ ${#UNVERIFIED_PACKAGES[@]} -gt 0 ]]; then
+      echo "  • double-check the package name"
+      echo "  • confirm network access and 'gh auth status' if the API failed"
+    fi
+    echo "  • re-run with --only-stable to proceed with just the packages that passed"
+    echo "  • re-run with --force if you have vetted it yourself"
+    exit 1
+  fi
+fi
+
+# --- run brew normally --------------------------------------------------
+echo "→ running: brew ${BREW_ARGS[*]}"
+echo
+exec "$BREW_BIN" "${BREW_ARGS[@]}"
