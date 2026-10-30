@@ -41,6 +41,11 @@
 # unconditionally, which made it impossible to pass to any brew subcommand.
 # `--` still forwards everything after it verbatim.
 #
+# About -d: brew's install/upgrade/reinstall use -d for --debug, so -d is
+# *our* days flag only before the subcommand. After the subcommand it belongs
+# to brew — `brew-safe install -d foo` reaches brew as `install -d foo`. The
+# long form --days has no brew equivalent and is ours anywhere.
+#
 # About --only-stable: instead of aborting the whole run when some packages are
 # too fresh or unverifiable, run brew on *only* the packages that passed the
 # age check and skip the rest. Purely our flag (brew has no such option), so it
@@ -99,6 +104,7 @@ is_age_checked "$SUBCOMMAND" && OWNS_FORCE=1
 # --- pass 2: split our flags from brew's --------------------------------
 BREW_ARGS=()
 passthrough=0
+past_subcommand=0
 while [[ $# -gt 0 ]]; do
   if ((passthrough)); then
     BREW_ARGS+=("$1")
@@ -107,6 +113,11 @@ while [[ $# -gt 0 ]]; do
   fi
   case "$1" in
     -d | --days)
+      if [[ "$1" == "-d" ]] && ((past_subcommand)); then
+        BREW_ARGS+=("$1") # brew's: -d is its --debug
+        shift
+        continue
+      fi
       [[ -z "${2:-}" ]] && {
         echo "error: $1 requires a value" >&2
         exit 2
@@ -142,6 +153,7 @@ while [[ $# -gt 0 ]]; do
       passthrough=1
       ;;
     *)
+      past_subcommand=1
       BREW_ARGS+=("$1")
       shift
       ;;

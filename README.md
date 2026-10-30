@@ -137,7 +137,7 @@ brew-safe [-d DAYS] [-j JOBS] [--force | --only-stable] <brew args...>
 
 | Flag | Meaning |
 | --- | --- |
-| `-d`, `--days DAYS` | Minimum age in days (default `5`). `-d 0` disables the threshold for one run. |
+| `-d`, `--days DAYS` | Minimum age in days (default `5`). `-d 0` disables the threshold for one run. Put `-d` before the subcommand; after it, `-d` is brew's (see below). |
 | `-j`, `--jobs JOBS` | How many packages to check in parallel, 1–64 (default `8`). `-j 1` checks them one at a time. |
 | `--force` | Run the checks and print the report, then install anyway. |
 | `--only-stable` | Run brew on only the packages that passed and skip the rest. Exits `0` if none passed. |
@@ -145,7 +145,8 @@ brew-safe [-d DAYS] [-j JOBS] [--force | --only-stable] <brew args...>
 
 `--force` and `--only-stable` are mutually exclusive.
 
-These flags can appear before or after the subcommand:
+These flags can go before or after the subcommand, except `-d`, which only works
+before it:
 
 ```sh
 brew-safe install ripgrep                 # check, then install
@@ -160,7 +161,17 @@ brew-safe -j 4 upgrade                    # at most 4 checks at once
 Checks run concurrently, but output stays in argument order and brew runs only once,
 after all checks have finished.
 
-### `--force` and pass-through subcommands
+### Flags that brew also uses
+
+brew's `install`, `upgrade` and `reinstall` have their own `-d` (`--debug`). brew-safe
+reads `-d` as the days threshold only **before** the subcommand. After the subcommand,
+`-d` is passed to brew. `--days` works on either side.
+
+```sh
+brew-safe -d 0 install ripgrep      # days threshold of 0
+brew-safe install -d ripgrep        # brew install --debug, with the default 5-day check
+brew-safe install --days 0 ripgrep  # same as the first line
+```
 
 `--force` is treated as brew-safe's own flag only for `install`, `upgrade` and
 `reinstall`. For any other subcommand it is forwarded to brew, so

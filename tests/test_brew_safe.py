@@ -262,6 +262,21 @@ class BrewSafeTests(unittest.TestCase):
                 self.assertEqual(self.run_safe("install", flag).returncode, 2)
         self.assertEqual(self.events(), [])
 
+    def test_short_days_flag_after_subcommand_is_brews_debug_flag(self):
+        self.configure({"fresh": {"age": 1}})
+        result = self.run_safe("install", "-d", "fresh")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("within the last 5 days", result.stdout)
+        result = self.run_safe("-d", "0", "install", "-d", "fresh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_safe("install", "--days", "0", "fresh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_safe("uninstall", "-d", "fresh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([e["args"] for e in self.events("run")],
+                         [["install", "-d", "fresh"], ["install", "fresh"],
+                          ["uninstall", "-d", "fresh"]])
+
     def test_passthrough_and_separator(self):
         self.configure({})
         result = self.run_safe("-j", "2", "tap", "homebrew/core", "--force")
