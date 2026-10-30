@@ -198,3 +198,7 @@ rm ~/.local/bin/brew-safe
 ```
 
 Then remove the `brew` function from your shell config, if you added it.
+
+## License
+
+[GNU Affero General Public License v3.0](LICENSE)
