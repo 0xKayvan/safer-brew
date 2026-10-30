@@ -84,21 +84,28 @@ bash --version           # should report 4.x or 5.x, not 3.2
 ### 2. Clone the repository and put `brew-safe` on your PATH
 
 ```sh
-git clone https://github.com/0xKayvan/safer-brew.git ~/Developer/safer-brew
+git clone https://github.com/0xKayvan/safer-brew.git ~/.config/safer-brew
 mkdir -p ~/.local/bin
-ln -s ~/Developer/safer-brew/bin/brew-safe ~/.local/bin/brew-safe
+ln -sf ~/.config/safer-brew/bin/brew-safe ~/.local/bin/brew-safe   # -f replaces an existing link
 ```
 
-Make sure `~/.local/bin` is on your `PATH` (e.g. in `~/.zshrc`):
+Make sure `~/.local/bin` is on your `PATH`:
 
 ```sh
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"   # zsh / bash: add to ~/.zshrc or ~/.bashrc
+fish_add_path ~/.local/bin             # fish: run once, it persists
 ```
 
 Check it:
 
 ```sh
 brew-safe --version      # not age-checked, so it is passed straight to brew
+```
+
+To update later, pull the clone. The symlink keeps pointing at it:
+
+```sh
+git -C ~/.config/safer-brew pull
 ```
 
 ### 3. (Optional) Replace `brew` with `brew-safe`
@@ -206,6 +213,7 @@ python3 -m unittest discover -s tests -v
 
 ```sh
 rm ~/.local/bin/brew-safe
+rm -rf ~/.config/safer-brew
 ```
 
 Then remove the `brew` function from your shell config, if you added it.
